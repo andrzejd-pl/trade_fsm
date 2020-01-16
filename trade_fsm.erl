@@ -2,15 +2,15 @@
 -behaviour(gen_fsm).
 
 %% public API
--export([start/1, start_link/1, trade/2, accept_trade/1, end_transation/1,
-         make_offer/2, retract_offer/2, ready/1, cancel/1]).
+-export([start/1, start_link/1, trade/2, accept_trade/1, 
+         make_offer/2, retract_offer/2, ready/1, cancel/1, end_transation/2]).
 %% gen_fsm callbacks
 -export([init/1, handle_event/3, handle_sync_event/4, handle_info/3,
          terminate/3, code_change/4,
          % custom state names
          idle/2, idle/3, idle_wait/2, idle_wait/3, negotiate/2,
          negotiate/3, wait/2, ready/2, ready/3,
-         end_of_trading/2]).
+         negotiate_wait/3]).
 
 -record(state, {name="",
                 other,
@@ -42,13 +42,13 @@ make_offer(OwnPid, Item) ->
 retract_offer(OwnPid, Item) ->
     gen_fsm:send_event(OwnPid, {retract_offer, Item}).
 
-end_transation(OwnPid) ->
-    gen_fsm:sync_send_event(OwnPid, end_transation, infinity).
-
 %% Mention that you're ready for a trade. When the other
 %% player also declares being ready, the trade is done
 ready(OwnPid) ->
     gen_fsm:sync_send_event(OwnPid, ready, infinity).
+
+end_transation(OwnPid, Timeout) ->
+    gen_fsm:sync_send_event(OwnPid, {ready, Timeout}, Timeout).
 
 %% Cancel the transaction.
 cancel(OwnPid) ->
@@ -79,13 +79,13 @@ undo_offer(OtherPid, Item) ->
 are_you_ready(OtherPid) ->
     gen_fsm:send_event(OtherPid, are_you_ready).
 
+are_you_ready(OtherPid, Timeout) ->
+    gen_fsm:send_event(OtherPid, {are_you_ready, Timeout}).
+
 %% Reply that the side is not ready to trade
 %% i.e. is not in 'wait' state.
 not_yet(OtherPid) ->
     gen_fsm:send_event(OtherPid, not_yet).
-
-notify_end_transaction(OtherPid) ->
-    gen_fsm:send_event(OtherPid, notify_end_transaction).
 
 %% Tells the other fsm that the user is currently waiting
 %% for the ready state. State should transition to 'ready'
@@ -186,14 +186,14 @@ negotiate({undo_offer, Item}, S=#state{otheritems=OtherItems}) ->
     {next_state, negotiate, S#state{otheritems=remove(Item, OtherItems)}};
 %% Other side has declared itself ready. Our own FSM should tell it to
 %% wait (with not_yet/1).
-negotiate(are_you_ready, S=#state{other=OtherPid}) ->
-    io:format("Other user ready to trade.~n"),
+negotiate({are_you_ready, Timeout}, S=#state{other=OtherPid}) ->
+    io:format("Other user ready to trade. Timeout: ~p.~n", [Timeout]),
     notice(S,
            "Other user ready to transfer goods:~n"
            "You get ~p, The other side gets ~p",
            [S#state.otheritems, S#state.ownitems]),
     not_yet(OtherPid),
-    {next_state, negotiate, S};
+    {next_state, negotiate_wait, S};
 negotiate(Event, Data) ->
     unexpected(Event, negotiate),
     {next_state, negotiate, Data}.
@@ -201,52 +201,47 @@ negotiate(Event, Data) ->
 %% own user mentioning he is ready. Next state should be wait
 %% and we add the 'from' to the state so we can reply to the
 %% user once ready.
-negotiate(ready, From, S = #state{other=OtherPid}) ->
-    are_you_ready(OtherPid),
+negotiate({ready, Timeout}, From, S = #state{other=OtherPid}) ->
+    are_you_ready(OtherPid, Timeout),
     notice(S, "asking if ready, waiting", []),
     {next_state, wait, S#state{from=From}};
 negotiate(Event, _From, S) ->
     unexpected(Event, negotiate),
     {next_state, negotiate, S}.
 
-%% other side offering an item. Don't forget our client is still
-%% waiting for a reply, so let's tell them the trade state changed
-%% and move back to the negotiate state
-wait({do_offer, Item}, S=#state{otheritems=OtherItems}) ->
-    gen_fsm:reply(S#state.from, offer_changed),
-    notice(S, "other side offering ~p", [Item]),
-    {next_state, negotiate, S#state{otheritems=add(Item, OtherItems)}};
-%% other side cancelling an item offer. Don't forget our client is still
-%% waiting for a reply, so let's tell them the trade state changed
-%% and move back to the negotiate state
-wait({undo_offer, Item}, S=#state{otheritems=OtherItems}) ->
-    gen_fsm:reply(S#state.from, offer_changed),
-    notice(S, "Other side cancelling offer of ~p", [Item]),
-    {next_state, negotiate, S#state{otheritems=remove(Item, OtherItems)}};
-wait(notify_end_transaction, S=#state{other=OtherPid}) ->
-    notify_end_transaction(OtherPid),
-    notice(S, "end_of_trade", []),
-    {next_state, end_of_trading, S};
-wait(Event, Data) ->
-    unexpected(Event, wait),
-    {next_state, wait, Data}.
+negotiate_wait(ready, From, S = #state{other=OtherPid}) ->
+    are_you_ready(OtherPid),
+    notice(S, "asking if ready, waiting", []),
+    {next_state, wait, S#state{from=From}};
+negotiate_wait(Event, _From, S) ->
+    unexpected(Event, negotiate_wait),
+    {next_state, negotiate_wait, S}.
 
-end_of_trading(are_you_ready, S=#state{}) ->
+%% The other client falls in ready state and asks us about it.
+%% However, the other client could have moved out of wait state already.
+%% Because of this, we send that we indeed are 'ready!' and hope for them
+%% to do the same.
+wait(are_you_ready, S=#state{}) ->
     am_ready(S#state.other),
     notice(S, "asked if ready, and I am. Waiting for same reply", []),
-    {next_state, end_of_trading, S};
-end_of_trading(not_yet,S = #state{}) ->
+    {next_state, wait, S};
+%% The other client is not ready to trade yet. We keep waiting
+%% and won't reply to our own client yet.
+wait(not_yet, S = #state{}) ->
     notice(S, "Other not ready yet", []),
-    {next_state, end_of_trading, S};
-end_of_trading('ready!', S=#state{}) ->
+    {next_state, wait, S};
+%% The other client was waiting for us! Let's reply to ours and
+%% send the ack message for the commit initiation on the other end.
+%% We can't go back after this.
+wait('ready!', S=#state{}) ->
     am_ready(S#state.other),
     ack_trans(S#state.other),
     gen_fsm:reply(S#state.from, ok),
     notice(S, "other side is ready. Moving to ready state", []),
     {next_state, ready, S};
-end_of_trading(Event, Data) ->
-    unexpected(Event, end_of_trading),
-    {next_state, end_of_trading, Data}.
+wait(Event, Data) ->
+    unexpected(Event, wait),
+    {next_state, wait, Data}.
 
 %% Ready state with the acknowledgement message coming from the
 %% other side. We determine if we should begin the synchronous
